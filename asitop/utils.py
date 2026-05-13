@@ -1,37 +1,53 @@
 import os
-import glob
 import subprocess
 from subprocess import PIPE
 import psutil
 from .parsers import *
+from .std_reader import PowermetricsReader
 import plistlib
 
 
+def parse_powermetrics_plist(powermetrics_parse):
+    thermal_pressure = parse_thermal_pressure(powermetrics_parse)
+    cpu_metrics_dict = parse_cpu_metrics(powermetrics_parse)
+    gpu_metrics_dict = parse_gpu_metrics(powermetrics_parse)
+    #bandwidth_metrics = parse_bandwidth_metrics(powermetrics_parse)
+    bandwidth_metrics = None
+    timestamp = powermetrics_parse["timestamp"]
+    return cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp
+
+
+def read_latest_plist(path, chunk_size=1024 * 1024):
+    with open(path, 'rb') as fp:
+        fp.seek(0, os.SEEK_END)
+        file_size = fp.tell()
+        offset = file_size
+        data = b''
+
+        while offset > 0:
+            read_size = min(chunk_size, offset)
+            offset -= read_size
+            fp.seek(offset)
+            data = fp.read(read_size) + data
+
+            chunks = [chunk for chunk in data.split(b'\x00') if chunk.strip()]
+            for chunk in reversed(chunks):
+                try:
+                    return plistlib.loads(chunk)
+                except Exception:
+                    pass
+
+    return None
+
+
 def parse_powermetrics(path='/tmp/asitop_powermetrics', timecode="0"):
-    data = None
+    powermetrics_parse = None
     try:
-        with open(path+timecode, 'rb') as fp:
-            data = fp.read()
-        data = data.split(b'\x00')
-        powermetrics_parse = plistlib.loads(data[-1])
-        thermal_pressure = parse_thermal_pressure(powermetrics_parse)
-        cpu_metrics_dict = parse_cpu_metrics(powermetrics_parse)
-        gpu_metrics_dict = parse_gpu_metrics(powermetrics_parse)
-        #bandwidth_metrics = parse_bandwidth_metrics(powermetrics_parse)
-        bandwidth_metrics = None
-        timestamp = powermetrics_parse["timestamp"]
-        return cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp
+        powermetrics_parse = read_latest_plist(path+timecode)
+        if powermetrics_parse is None:
+            return False
+        return parse_powermetrics_plist(powermetrics_parse)
     except Exception as e:
-        if data:
-            if len(data) > 1:
-                powermetrics_parse = plistlib.loads(data[-2])
-                thermal_pressure = parse_thermal_pressure(powermetrics_parse)
-                cpu_metrics_dict = parse_cpu_metrics(powermetrics_parse)
-                gpu_metrics_dict = parse_gpu_metrics(powermetrics_parse)
-                #bandwidth_metrics = parse_bandwidth_metrics(powermetrics_parse)
-                bandwidth_metrics = None
-                timestamp = powermetrics_parse["timestamp"]
-                return cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp
         return False
 
 
@@ -44,25 +60,24 @@ def convert_to_GB(value):
     return round(value/1024/1024/1024, 1)
 
 
-def run_powermetrics_process(timecode, nice=10, interval=1000):
+def run_powermetrics_process(timecode=None, nice=10, interval=1000):
     #ver, *_ = platform.mac_ver()
     #major_ver = int(ver.split(".")[0])
-    for tmpf in glob.glob("/tmp/asitop_powermetrics*"):
-        os.remove(tmpf)
-    output_file_flag = "-o"
-    command = " ".join([
-        "sudo nice -n",
+    command = [
+        "sudo",
+        "nice",
+        "-n",
         str(nice),
         "powermetrics",
-        "--samplers cpu_power,gpu_power,thermal",
-        output_file_flag,
-        "/tmp/asitop_powermetrics"+timecode,
-        "-f plist",
+        "--samplers",
+        "cpu_power,gpu_power,thermal",
+        "-f",
+        "plist",
         "-i",
         str(interval)
-    ])
-    process = subprocess.Popen(command.split(" "), stdin=PIPE, stdout=PIPE)
-    return process
+    ]
+    process = subprocess.Popen(command, stdin=PIPE, stdout=PIPE)
+    return PowermetricsReader(process, parse_powermetrics_plist)
 
 
 def get_ram_metrics_dict():

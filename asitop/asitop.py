@@ -19,6 +19,36 @@ parser.add_argument('--max_count', type=int, default=0,
 args = parser.parse_args()
 
 
+def get_display_cpu_clusters(cpu_metrics_dict):
+    cluster_labels = ("P", "S") if cpu_metrics_dict.get("has_s_cluster", False) else ("E", "P")
+    return [
+        (label, list(cpu_metrics_dict.get(f"{label.lower()}_core", [])))
+        for label in cluster_labels
+    ]
+
+
+def get_core_rows(core_gauges, row_size=8):
+    return [
+        HSplit(*core_gauges[i:i + row_size])
+        for i in range(0, len(core_gauges), row_size)
+    ]
+
+
+def get_cpu_title(soc_info_dict, display_clusters):
+    cluster_counts = "+".join([
+        str(len(cores)) + label
+        for label, cores in display_clusters
+    ])
+    return "".join([
+        soc_info_dict["name"],
+        " (cores: ",
+        cluster_counts,
+        "+",
+        str(soc_info_dict["gpu_core_count"]),
+        "GPU)"
+    ])
+
+
 def main():
     print("\nASITOP - Performance monitoring CLI tool for Apple Silicon")
     print("You can update ASITOP by running `pip install asitop --upgrade`")
@@ -27,34 +57,59 @@ def main():
     print("\n[1/3] Loading ASITOP\n")
     print("\033[?25l")
 
-    cpu1_gauge = HGauge(title="E-CPU Usage", val=0, color=args.color)
-    cpu2_gauge = HGauge(title="P-CPU Usage", val=0, color=args.color)
+    soc_info_dict = get_soc_info()
+    cpu_max_power = soc_info_dict["cpu_max_power"]
+    gpu_max_power = soc_info_dict["gpu_max_power"]
+    ane_max_power = 8.0
+    """max_cpu_bw = soc_info_dict["cpu_max_bw"]
+    max_gpu_bw = soc_info_dict["gpu_max_bw"]
+    max_media_bw = 7.0"""
+
+    cpu_peak_power = 0
+    gpu_peak_power = 0
+    package_peak_power = 0
+
+    print("\n[2/3] Starting powermetrics process\n")
+
+    powermetrics_process = run_powermetrics_process(interval=args.interval * 1000)
+
+    print("\n[3/3] Waiting for first reading...\n")
+
+    def get_reading(wait=0.1):
+        ready = powermetrics_process.latest()
+        while not ready:
+            time.sleep(wait)
+            ready = powermetrics_process.latest()
+        return ready
+
+    ready = get_reading()
+    cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp = ready
+    last_timestamp = timestamp
+    display_clusters = get_display_cpu_clusters(cpu_metrics_dict)
+
+    cpu_cluster_gauges = {
+        label: HGauge(title=f"{label}-CPU Usage", val=0, color=args.color)
+        for label, _ in display_clusters
+    }
+    core_gauge_groups = {
+        label: [VGauge(val=0, color=args.color, border_color=args.color) for _ in cores]
+        for label, cores in display_clusters
+    }
     gpu_gauge = HGauge(title="GPU Usage", val=0, color=args.color)
     ane_gauge = HGauge(title="ANE", val=0, color=args.color)
     gpu_ane_gauges = [gpu_gauge, ane_gauge]
 
-    soc_info_dict = get_soc_info()
-    e_core_count = soc_info_dict["e_core_count"]
-    e_core_gauges = [VGauge(val=0, color=args.color, border_color=args.color) for _ in range(e_core_count)]
-    p_core_count = soc_info_dict["p_core_count"]
-    p_core_gauges = [VGauge(val=0, color=args.color, border_color=args.color) for _ in range(min(p_core_count, 8))]
-    p_core_split = [HSplit(
-        *p_core_gauges,
-    )]
-    if p_core_count > 8:
-        p_core_gauges_ext = [VGauge(val=0, color=args.color, border_color=args.color) for _ in range(p_core_count - 8)]
-        p_core_split.append(HSplit(
-            *p_core_gauges_ext,
-        ))
-    processor_gauges = [cpu1_gauge,
-                        HSplit(*e_core_gauges),
-                        cpu2_gauge,
-                        *p_core_split,
-                        *gpu_ane_gauges
-                        ] if args.show_cores else [
-        HSplit(cpu1_gauge, cpu2_gauge),
-        HSplit(*gpu_ane_gauges)
-    ]
+    processor_gauges = []
+    if args.show_cores:
+        for label, _ in display_clusters:
+            processor_gauges.append(cpu_cluster_gauges[label])
+            processor_gauges.extend(get_core_rows(core_gauge_groups[label]))
+        processor_gauges.extend(gpu_ane_gauges)
+    else:
+        processor_gauges = [
+            HSplit(*[cpu_cluster_gauges[label] for label, _ in display_clusters]),
+            HSplit(*gpu_ane_gauges)
+        ]
     processor_split = VSplit(
         *processor_gauges,
         title="Processor Utilization",
@@ -118,46 +173,7 @@ def main():
     usage_gauges = ui.items[0]
     #bw_gauges = memory_gauges.items[1]
 
-    cpu_title = "".join([
-        soc_info_dict["name"],
-        " (cores: ",
-        str(soc_info_dict["e_core_count"]),
-        "E+",
-        str(soc_info_dict["p_core_count"]),
-        "P+",
-        str(soc_info_dict["gpu_core_count"]),
-        "GPU)"
-    ])
-    usage_gauges.title = cpu_title
-    cpu_max_power = soc_info_dict["cpu_max_power"]
-    gpu_max_power = soc_info_dict["gpu_max_power"]
-    ane_max_power = 8.0
-    """max_cpu_bw = soc_info_dict["cpu_max_bw"]
-    max_gpu_bw = soc_info_dict["gpu_max_bw"]
-    max_media_bw = 7.0"""
-
-    cpu_peak_power = 0
-    gpu_peak_power = 0
-    package_peak_power = 0
-
-    print("\n[2/3] Starting powermetrics process\n")
-
-    timecode = str(int(time.time()))
-
-    powermetrics_process = run_powermetrics_process(timecode,
-                                                    interval=args.interval * 1000)
-
-    print("\n[3/3] Waiting for first reading...\n")
-
-    def get_reading(wait=0.1):
-        ready = parse_powermetrics(timecode=timecode)
-        while not ready:
-            time.sleep(wait)
-            ready = parse_powermetrics(timecode=timecode)
-        return ready
-
-    ready = get_reading()
-    last_timestamp = ready[-1]
+    usage_gauges.title = get_cpu_title(soc_info_dict, display_clusters)
 
     def get_avg(inlist):
         avg = sum(inlist) / len(inlist)
@@ -176,11 +192,10 @@ def main():
                 if count >= args.max_count:
                     count = 0
                     powermetrics_process.terminate()
-                    timecode = str(int(time.time()))
                     powermetrics_process = run_powermetrics_process(
-                        timecode, interval=args.interval * 1000)
+                        interval=args.interval * 1000)
                 count += 1
-            ready = parse_powermetrics(timecode=timecode)
+            ready = powermetrics_process.latest()
             if ready:
                 cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp = ready
 
@@ -192,44 +207,30 @@ def main():
                     else:
                         thermal_throttle = "yes"
 
-                    cpu1_gauge.title = "".join([
-                        "E-CPU Usage: ",
-                        str(cpu_metrics_dict["E-Cluster_active"]),
-                        "% @ ",
-                        str(cpu_metrics_dict["E-Cluster_freq_Mhz"]),
-                        " MHz"
-                    ])
-                    cpu1_gauge.value = cpu_metrics_dict["E-Cluster_active"]
-
-                    cpu2_gauge.title = "".join([
-                        "P-CPU Usage: ",
-                        str(cpu_metrics_dict["P-Cluster_active"]),
-                        "% @ ",
-                        str(cpu_metrics_dict["P-Cluster_freq_Mhz"]),
-                        " MHz"
-                    ])
-                    cpu2_gauge.value = cpu_metrics_dict["P-Cluster_active"]
+                    for label, _ in display_clusters:
+                        gauge = cpu_cluster_gauges[label]
+                        gauge.title = "".join([
+                            f"{label}-CPU Usage: ",
+                            str(cpu_metrics_dict[f"{label}-Cluster_active"]),
+                            "% @ ",
+                            str(cpu_metrics_dict[f"{label}-Cluster_freq_Mhz"]),
+                            " MHz"
+                        ])
+                        gauge.value = cpu_metrics_dict[f"{label}-Cluster_active"]
 
                     if args.show_cores:
-                        core_count = 0
-                        for i in cpu_metrics_dict["e_core"]:
-                            e_core_gauges[core_count % 4].title = "".join([
-                                "Core-" + str(i + 1) + " ",
-                                str(cpu_metrics_dict["E-Cluster" + str(i) + "_active"]),
-                                "%",
-                            ])
-                            e_core_gauges[core_count % 4].value = cpu_metrics_dict["E-Cluster" + str(i) + "_active"]
-                            core_count += 1
-                        core_count = 0
-                        for i in cpu_metrics_dict["p_core"]:
-                            core_gauges = p_core_gauges if core_count < 8 else p_core_gauges_ext
-                            core_gauges[core_count % 8].title = "".join([
-                                ("Core-" if p_core_count < 6 else 'C-') + str(i + 1) + " ",
-                                str(cpu_metrics_dict["P-Cluster" + str(i) + "_active"]),
-                                "%",
-                            ])
-                            core_gauges[core_count % 8].value = cpu_metrics_dict["P-Cluster" + str(i) + "_active"]
-                            core_count += 1
+                        for label, _ in display_clusters:
+                            core_gauges = core_gauge_groups[label]
+                            for core_count, i in enumerate(cpu_metrics_dict[f"{label.lower()}_core"]):
+                                if core_count >= len(core_gauges):
+                                    break
+                                core_gauge = core_gauges[core_count]
+                                core_gauge.title = "".join([
+                                    f"{label}-Core-" + str(i + 1) + " ",
+                                    str(cpu_metrics_dict[f"{label}-Cluster" + str(i) + "_active"]),
+                                    "%",
+                                ])
+                                core_gauge.value = cpu_metrics_dict[f"{label}-Cluster" + str(i) + "_active"]
 
                     gpu_gauge.title = "".join([
                         "GPU Usage: ",
@@ -406,6 +407,7 @@ def main():
     except KeyboardInterrupt:
         print("Stopping...")
         print("\033[?25h")
+        powermetrics_process.terminate()
 
     return powermetrics_process
 
